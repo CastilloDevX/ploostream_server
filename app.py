@@ -5,14 +5,71 @@ import datetime
 import requests
 import json
 import time
+import os
+import sys
+import shutil
 
-from scrapers.service import ScraperService
-from scrapers.registry import provider_registry
-from dataclasses import asdict
+# ===========================
+#     CONFIGURACIÓN
+# ===========================
+
+VERSION_LOCAL = "1.0.0"  # Cambiable cada que se hace una nueva versión
+VERSION_URL = "https://raw.githubusercontent.com/CastilloDevX/ploostream_server/main/version.txt"
+EXE_URL = "https://github.com/CastilloDevX/ploostream_server/releases/latest/download/PloostreamScraper.exe"
 
 FIREBASE_URL = "https://ploostream-db-default-rtdb.firebaseio.com/content.json"
 INTERVALO_SEGUNDOS = 3600  # 1 hora
 
+
+# ===========================
+#   LÓGICA DE AUTO UPDATE
+# ===========================
+
+def check_for_updates():
+    try:
+        version_remota = requests.get(VERSION_URL, timeout=10).text.strip()
+
+        if version_remota == VERSION_LOCAL:
+            print("Ya estás actualizado")
+            return  # Está actualizado
+
+        print(f"Nueva versión detectada: {version_remota}")
+
+        exe_actual = sys.executable
+        nuevo_exe = exe_actual + ".new"
+
+        # Descargar nueva versión
+        with requests.get(EXE_URL, stream=True) as r:
+            r.raise_for_status()
+            with open(nuevo_exe, "wb") as f:
+                shutil.copyfileobj(r.raw, f)
+
+        # Script temporal para reemplazar el exe
+        updater = exe_actual + "_update.bat"
+        with open(updater, "w") as f:
+            f.write(f"""
+@echo off
+timeout /t 2 >NUL
+del "{exe_actual}"
+rename "{nuevo_exe}" "{os.path.basename(exe_actual)}"
+start "" "{exe_actual}"
+del "%~f0"
+""")
+
+        os.startfile(updater)
+        sys.exit()
+
+    except Exception as e:
+        print("Error al buscar actualización:", e)
+
+
+# ===========================
+#     FUNCIÓN SCRAPING
+# ===========================
+
+from scrapers.service import ScraperService
+from scrapers.registry import provider_registry
+from dataclasses import asdict
 
 def deep_clean(obj):
     if isinstance(obj, dict):
@@ -48,17 +105,16 @@ def ejecutar_scraping(ui_update_callback, limpiar=True):
         ui_update_callback(f"✔ Scrapeo completado")
         ui_update_callback(f"→ ({timestamp}) Eventos obtenidos: {count}")
 
-        json.dumps(data)  # validación
+        json.dumps(data)
 
-        ui_update_callback(f"⏳ Enviando datos a la base de datos ...")
-        
+        ui_update_callback(f"⏳ Enviando datos a Firebase ...")
+
         response = requests.put(
             FIREBASE_URL,
             json=data,
             headers={"Content-Type": "application/json"},
             timeout=30
         )
-        
 
         if response.status_code in (200, 201):
             ui_update_callback("✅ Datos enviados correctamente a Firebase.")
@@ -69,6 +125,10 @@ def ejecutar_scraping(ui_update_callback, limpiar=True):
         ui_update_callback(f"❌ Error:\n{str(e)}\n")
 
 
+# ===========================
+#          GUI TKINTER
+# ===========================
+
 class ScraperGUI:
     def __init__(self, root):
         self.root = root
@@ -77,18 +137,15 @@ class ScraperGUI:
         self.root.configure(bg="#0d1b2a")
         self.auto_mode = tk.BooleanVar(value=False)
 
-        # Título
         tk.Label(
             root, text="Ploostream Scraper",
             font=("Segoe UI", 16, "bold"),
             fg="white", bg="#0d1b2a"
         ).pack(pady=10)
 
-        # Controles superiores
         top_frame = tk.Frame(root, bg="#0d1b2a")
         top_frame.pack(pady=5, fill="x", padx=20)
 
-        # Botones
         tk.Button(
             top_frame, text="🕹 Scrapear",
             font=("Segoe UI", 11, "bold"),
@@ -109,14 +166,11 @@ class ScraperGUI:
             variable=self.auto_mode,
             font=("Segoe UI", 11),
             bg="#0d1b2a", fg="white",
-            activebackground="#0d1b2a",
-            activeforeground="white",
             selectcolor="#1d3557",
             command=self.toggle_auto_scraping
         )
         self.switch.pack(side="right")
 
-        # Consola
         self.log_box = scrolledtext.ScrolledText(
             root, width=70, height=20,
             font=("Consolas", 10),
@@ -136,17 +190,16 @@ class ScraperGUI:
         self.log_box.delete("1.0", tk.END)
 
     def run_scraping_thread(self):
-        thread = threading.Thread(
+        threading.Thread(
             target=ejecutar_scraping,
-            args=(self.log,)
-        )
-        thread.start()
+            args=(self.log,),
+            daemon=True
+        ).start()
 
     def toggle_auto_scraping(self):
         if self.auto_mode.get():
             self.log("🔄 Modo automático activado (cada 1 hora)")
-            thread = threading.Thread(target=self.auto_scrape_loop, daemon=True)
-            thread.start()
+            threading.Thread(target=self.auto_scrape_loop, daemon=True).start()
         else:
             self.log("🛑 Modo automático desactivado")
 
@@ -159,7 +212,12 @@ class ScraperGUI:
                 time.sleep(1)
 
 
+# ===========================
+#   INICIO DE LA APLICACIÓN
+# ===========================
+
 if __name__ == "__main__":
+    check_for_updates()
     root = tk.Tk()
     app = ScraperGUI(root)
     root.mainloop()
