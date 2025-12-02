@@ -13,7 +13,7 @@ from scrapers.service import ScraperService
 from scrapers.registry import provider_registry
 from dataclasses import asdict
 
-VERSION_LOCAL = "1.0.0"
+VERSION_LOCAL = "1.0.2"
 VERSION_URL = "https://raw.githubusercontent.com/CastilloDevX/ploostream_server/main/version.txt"
 EXE_URL = "https://github.com/CastilloDevX/ploostream_server/releases/latest/download/PloostreamScraper.exe"
 FIREBASE_URL = "https://ploostream-db-default-rtdb.firebaseio.com/content.json"
@@ -104,7 +104,7 @@ def ejecutar_scraping(ui_update_callback, limpiar=True):
         json.dumps(data)
 
         ui_update_callback("⏳ Enviando datos a Firebase ...")
-        # response = requests.put(FIREBASE_URL, json=data, headers={"Content-Type": "application/json"}, timeout=30)
+        response = requests.put(FIREBASE_URL, json=data, headers={"Content-Type": "application/json"}, timeout=30)
         if response.status_code in (200, 201):
              ui_update_callback("✅ Datos enviados correctamente a Firebase.")
         else:
