@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
-
 @dataclass
 class Stream:
     name: str
@@ -11,7 +10,6 @@ class Stream:
 
     def to_dict(self):
         return asdict(self)
-
 
 @dataclass
 class Event:

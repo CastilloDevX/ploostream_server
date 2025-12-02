@@ -9,42 +9,35 @@ import os
 import sys
 import shutil
 
-# ===========================
-#     CONFIGURACIÓN
-# ===========================
+from scrapers.service import ScraperService
+from scrapers.registry import provider_registry
+from dataclasses import asdict
 
-VERSION_LOCAL = "1.0.0"  # Cambiable cada que se hace una nueva versión
+VERSION_LOCAL = "1.0.0"
 VERSION_URL = "https://raw.githubusercontent.com/CastilloDevX/ploostream_server/main/version.txt"
 EXE_URL = "https://github.com/CastilloDevX/ploostream_server/releases/latest/download/PloostreamScraper.exe"
-
 FIREBASE_URL = "https://ploostream-db-default-rtdb.firebaseio.com/content.json"
-INTERVALO_SEGUNDOS = 3600  # 1 hora
-
+MIN_INTERVAL_SECONDS = 900  # 15 minutos
 
 # ===========================
-#   LÓGICA DE AUTO UPDATE
+#   ACTUALIZACIÓN AUTOMÁTICA
 # ===========================
-
 def check_for_updates():
     try:
         version_remota = requests.get(VERSION_URL, timeout=10).text.strip()
-
         if version_remota == VERSION_LOCAL:
             print("Ya estás actualizado")
-            return  # Está actualizado
+            return
 
         print(f"Nueva versión detectada: {version_remota}")
-
         exe_actual = sys.executable
         nuevo_exe = exe_actual + ".new"
 
-        # Descargar nueva versión
         with requests.get(EXE_URL, stream=True) as r:
             r.raise_for_status()
             with open(nuevo_exe, "wb") as f:
                 shutil.copyfileobj(r.raw, f)
 
-        # Script temporal para reemplazar el exe
         updater = exe_actual + "_update.bat"
         with open(updater, "w") as f:
             f.write(f"""
@@ -66,11 +59,6 @@ del "%~f0"
 # ===========================
 #     FUNCIÓN SCRAPING
 # ===========================
-
-from scrapers.service import ScraperService
-from scrapers.registry import provider_registry
-from dataclasses import asdict
-
 def deep_clean(obj):
     if isinstance(obj, dict):
         return {str(k): deep_clean(v) for k, v in obj.items()}
@@ -83,7 +71,6 @@ def deep_clean(obj):
     elif isinstance(obj, datetime.datetime):
         return obj.isoformat()
     return str(obj)
-
 
 def ejecutar_scraping(ui_update_callback, limpiar=True):
     try:
@@ -105,21 +92,23 @@ def ejecutar_scraping(ui_update_callback, limpiar=True):
         ui_update_callback(f"✔ Scrapeo completado")
         ui_update_callback(f"→ ({timestamp}) Eventos obtenidos: {count}")
 
+        from collections import defaultdict
+        by_provider = defaultdict(list)
+        for ev in events:
+            by_provider[ev.provider].append(ev)
+
+        for provider, items in by_provider.items():
+            total_streams = sum(len(e.streams) for e in items)
+            ui_update_callback(f"🔸 {provider}: {len(items)} partidos, {total_streams} streams")
+
         json.dumps(data)
 
-        ui_update_callback(f"⏳ Enviando datos a Firebase ...")
-
-        response = requests.put(
-            FIREBASE_URL,
-            json=data,
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-
+        ui_update_callback("⏳ Enviando datos a Firebase ...")
+        # response = requests.put(FIREBASE_URL, json=data, headers={"Content-Type": "application/json"}, timeout=30)
         if response.status_code in (200, 201):
-            ui_update_callback("✅ Datos enviados correctamente a Firebase.")
+             ui_update_callback("✅ Datos enviados correctamente a Firebase.")
         else:
-            ui_update_callback(f"❌ Error HTTP: {response.status_code}")
+             ui_update_callback(f"❌ Error HTTP: {response.status_code}")
 
     except Exception as e:
         ui_update_callback(f"❌ Error:\n{str(e)}\n")
@@ -128,55 +117,36 @@ def ejecutar_scraping(ui_update_callback, limpiar=True):
 # ===========================
 #          GUI TKINTER
 # ===========================
-
 class ScraperGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Ploostream Scraper")
-        self.root.geometry("600x480")
+        self.root.geometry("620x520")
         self.root.configure(bg="#0d1b2a")
         self.auto_mode = tk.BooleanVar(value=False)
 
-        tk.Label(
-            root, text="Ploostream Scraper",
-            font=("Segoe UI", 16, "bold"),
-            fg="white", bg="#0d1b2a"
-        ).pack(pady=10)
+        tk.Label(root, text="Ploostream Scraper", font=("Segoe UI", 16, "bold"), fg="white", bg="#0d1b2a").pack(pady=10)
 
         top_frame = tk.Frame(root, bg="#0d1b2a")
         top_frame.pack(pady=5, fill="x", padx=20)
 
-        tk.Button(
-            top_frame, text="🕹 Scrapear",
-            font=("Segoe UI", 11, "bold"),
-            bg="#1d3557", fg="white",
-            command=self.run_scraping_thread
-        ).pack(side="left")
+        tk.Button(top_frame, text="🕹 Scrapear", font=("Segoe UI", 11, "bold"), bg="#1d3557", fg="white",
+                  command=self.run_scraping_thread).pack(side="left")
 
-        tk.Button(
-            top_frame, text="🧹 Limpiar",
-            font=("Segoe UI", 11),
-            bg="#6c757d", fg="white",
-            command=self.clear_log
-        ).pack(side="left", padx=(10, 0))
+        tk.Button(top_frame, text="🧹 Limpiar", font=("Segoe UI", 11), bg="#6c757d", fg="white",
+                  command=self.clear_log).pack(side="left", padx=(10, 0))
 
-        self.switch = tk.Checkbutton(
-            top_frame,
-            text="⏱ Auto (1h)",
-            variable=self.auto_mode,
-            font=("Segoe UI", 11),
-            bg="#0d1b2a", fg="white",
-            selectcolor="#1d3557",
-            command=self.toggle_auto_scraping
-        )
-        self.switch.pack(side="right")
+        self.interval_entry = tk.Entry(top_frame, width=10)
+        self.interval_entry.insert(0, "3600")
+        self.interval_entry.pack(side="right")
 
-        self.log_box = scrolledtext.ScrolledText(
-            root, width=70, height=20,
-            font=("Consolas", 10),
-            bg="#1b263b", fg="white",
-            insertbackground="white"
-        )
+        self.switch = tk.Checkbutton(top_frame, text="⏱ Auto", variable=self.auto_mode, font=("Segoe UI", 11),
+                                     bg="#0d1b2a", fg="white", selectcolor="#1d3557",
+                                     command=self.toggle_auto_scraping)
+        self.switch.pack(side="right", padx=(0, 10))
+
+        self.log_box = scrolledtext.ScrolledText(root, width=70, height=22, font=("Consolas", 10),
+                                                 bg="#1b263b", fg="white", insertbackground="white")
         self.log_box.pack(padx=20, pady=10)
 
     def log(self, text):
@@ -190,31 +160,34 @@ class ScraperGUI:
         self.log_box.delete("1.0", tk.END)
 
     def run_scraping_thread(self):
-        threading.Thread(
-            target=ejecutar_scraping,
-            args=(self.log,),
-            daemon=True
-        ).start()
+        threading.Thread(target=ejecutar_scraping, args=(self.log,), daemon=True).start()
 
     def toggle_auto_scraping(self):
+        try:
+            interval = int(self.interval_entry.get())
+            if interval < MIN_INTERVAL_SECONDS:
+                self.log("❌ Error: El intervalo debe ser de al menos 900 segundos (15 minutos).")
+                self.auto_mode.set(False)
+                return
+        except ValueError:
+            self.log("❌ Intervalo inválido. Ingresa un número entero.")
+            self.auto_mode.set(False)
+            return
+
         if self.auto_mode.get():
-            self.log("🔄 Modo automático activado (cada 1 hora)")
-            threading.Thread(target=self.auto_scrape_loop, daemon=True).start()
+            self.log(f"🔄 Modo automático activado (cada {interval} segundos)")
+            threading.Thread(target=self.auto_scrape_loop, args=(interval,), daemon=True).start()
         else:
             self.log("🛑 Modo automático desactivado")
 
-    def auto_scrape_loop(self):
+    def auto_scrape_loop(self, interval):
         while self.auto_mode.get():
             ejecutar_scraping(self.log)
-            for _ in range(INTERVALO_SEGUNDOS):
+            for _ in range(interval):
                 if not self.auto_mode.get():
                     return
                 time.sleep(1)
 
-
-# ===========================
-#   INICIO DE LA APLICACIÓN
-# ===========================
 
 if __name__ == "__main__":
     check_for_updates()
