@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import urllib3
 import concurrent.futures
+from datetime import datetime
 
 from ..base import BaseProvider
 from ..models import Event, Stream
@@ -39,77 +40,81 @@ class LiveTVProvider(BaseProvider):
             if not td_parent:
                 continue
 
-            # Solo incluir si el evento está en vivo
-            is_live = td_parent.find("img", src="//cdn.livetv869.me/img/live.gif")
-            if not is_live:
-                continue
+            if not td_parent.find("img", src="//cdn.livetv869.me/img/live.gif"):
+                continue  # solo eventos en vivo
+
+            event_url = urljoin("https://livetv.sx", a_tag["href"])
+            event_text = a_tag.get_text(strip=True)
+
+            home = away = league = date_text = ""
+
+            for sep in [" – ", " - ", " vs ", " Vs ", " v ", "–", "-"]:
+                if sep in event_text:
+                    home, away = map(str.strip, event_text.split(sep, 1))
+                    break
+            else:
+                home, away = "", ""
 
             span = td_parent.find("span", class_="evdesc")
-            date_text = league = ""
             if span:
                 full_text = span.get_text(separator="|", strip=True)
                 parts = full_text.split("|")
                 date_text = parts[0].strip() if len(parts) > 0 else ""
                 league = parts[1].strip(" ()") if len(parts) > 1 else ""
 
-            event_text = a_tag.get_text(strip=True)
-            for sep in [" – ", " - ", " vs ", " Vs ", " v ", "–", "-"]:
-                if sep in event_text:
-                    home, away = map(str.strip, event_text.split(sep, 1))
-                    break
-            else:
-                home, away = event_text.strip(), ""
-
-            event_url = a_tag["href"]
-            if not event_url.startswith("http"):
-                event_url = f"https://livetv.sx{event_url}"
-
             event_data.append((event_url, home, away, league, date_text))
 
-        # Cargar streams en paralelo
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_event = {
-                executor.submit(self.load_streams, url): (url, home, away, league, start_time)
-                for url, home, away, league, start_time in event_data
+                executor.submit(self._build_event_with_streams, *data): data[0]
+                for data in event_data
             }
             for future in concurrent.futures.as_completed(future_to_event):
-                url, home, away, league, start_time = future_to_event[future]
                 try:
-                    streams = future.result()
+                    event = future.result()
+                    if event:
+                        events.append(event)
                 except Exception as e:
-                    print(f"[LiveTV] ❌ Error en evento {url}: {e}")
-                    streams = []
-
-                event = Event(
-                    id=url,
-                    name=f"{home} vs {away}",
-                    url=url,
-                    league=league or "",
-                    home=home,
-                    away=away,
-                    match_time=start_time,
-                    start_time=0,
-                    provider=self.name,
-                    streams=streams,
-                    home_logo=get_team_logo(home),
-                    away_logo=get_team_logo(away),
-                    league_logo=get_team_logo(league)
-                )
-                events.append(event)
+                    print(f"[LiveTV] ❌ Error en evento {future_to_event[future]}: {e}")
 
         return events
 
-    def load_streams(self, event_url: str) -> List[Stream]:
-        streams: List[Stream] = []
-
+    def _build_event_with_streams(self, url: str, home: str, away: str, league: str, start: str) -> Event | None:
         try:
-            resp = requests.get(event_url, headers=UA_HEADERS, timeout=20, verify=False)
+            resp = requests.get(url, headers=UA_HEADERS, timeout=20, verify=False)
             resp.raise_for_status()
         except Exception as e:
-            print(f"[LiveTV] Error al cargar evento {event_url}: {e}")
-            return streams
+            print(f"[LiveTV] Error al cargar evento {url}: {e}")
+            return None
 
         soup = BeautifulSoup(resp.text, "html.parser")
+
+        if not home or not away:
+            h1 = soup.select_one("h1.sporttitle b")
+            if h1:
+                text = h1.get_text(strip=True)
+                for sep in [" – ", " - ", " vs ", " Vs ", " v ", "–", "-"]:
+                    if sep in text:
+                        home, away = map(str.strip, text.split(sep, 1))
+                        break
+
+        if not league:
+            liga_tag = soup.select_one("td.small b a.menu")
+            if liga_tag:
+                league = liga_tag.get_text(strip=True)
+
+        match_time = start
+        try:
+            time_tag = soup.select_one("td.small b")
+            if time_tag:
+                match_text = time_tag.get_text(strip=True)
+                match = re.search(r"\d{1,2} \w+ \d{4} at \d{1,2}:\d{2}", match_text)
+                if match:
+                    match_time = datetime.strptime(match.group(), "%d %B %Y at %H:%M")
+        except Exception as e:
+            print(f"[LiveTV] Error procesando match_time para {url}: {e}")
+
+        streams: List[Stream] = []
         found = 0
 
         for table in soup.find_all("table", class_="lnktbj"):
@@ -134,21 +139,53 @@ class LiveTVProvider(BaseProvider):
                 language=None
             ))
             found += 1
-        
-        # DEBUG
-        #if found:
-           # print(f"[LiveTV] {found} stream(s) encontrados para: {event_url}")
-        #else:
-        #    print(f"[LiveTV] No se encontraron streams en: {event_url}")
+        #DEBUG
+        #print("=" * 80)
+        #print(f"🏆 Liga              : {league}")
+        #print(f"🏠 Local             : {home}")
+        #print(f"🚌 Visitante         : {away}")
+        #print(f"🔗 URL del evento    : {url}")
+        #print(f"🎥 Streams ({len(streams)}):")
+        #print("=" * 80)
 
-        return streams
+        return Event(
+            id=url,
+            name=f"{home} vs {away}",
+            url=url,
+            league=league or "Próximamente",
+            home=home or "Próximamente",
+            away=away or "Próximamente",
+            match_time=match_time,
+            start_time=0,
+            provider=self.name,
+            streams=streams,
+            home_logo=get_team_logo(home),
+            away_logo=get_team_logo(away),
+            league_logo=get_team_logo(league)
+        )
 
-
+"""
 # DEBUG
 if __name__ == "__main__":
     liveTVProvider = LiveTVProvider()
     events = liveTVProvider.fetch_events()
+    
+
+    print(f"\n🟢 Total de eventos en vivo: {len(events)}\n")
+
     for e in events:
-        print(f"{e.name} | Fecha: {e.start_time} | Liga: {e.league} | Streams: {len(e.streams)}")
+        print("=" * 80)
+        print(f"📺 Nombre del evento : {e.name}")
+        print(f"🏆 Liga              : {e.league}")
+        print(f"⏰ Fecha/Hora        : {e.match_time}")
+        print(f"🏠 Local             : {e.home}")
+        print(f"🚌 Visitante         : {e.away}")
+        print(f"🖼 Logo Local        : {e.home_logo or 'N/A'}")
+        print(f"🖼 Logo Visitante    : {e.away_logo or 'N/A'}")
+        print(f"🖼 Logo Liga         : {e.league_logo or 'N/A'}")
+        print(f"🔗 URL del evento    : {e.url}")
+        print(f"🎥 Streams ({len(e.streams)}):")
         for s in e.streams:
-            print(f" → {s.name}: {s.url}")
+            print(f"   • {s.name or 'Sin nombre'} => {s.url}")
+        print("=" * 80 + "\n")
+"""
