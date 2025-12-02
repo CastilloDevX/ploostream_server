@@ -19,7 +19,7 @@ UA_HEADERS = {
 
 class LiveTVProvider(BaseProvider):
     name = "LiveTV"
-    LIST_URL = "https://livetv.sx/enx/allupcomingsports/1/"
+    LIST_URL = "https://livetv.sx/enx/allupcoming/"
 
     def fetch_events(self) -> List[Event]:
         events: List[Event] = []
@@ -37,6 +37,11 @@ class LiveTVProvider(BaseProvider):
         for a_tag in soup.find_all("a", class_="live", href=True):
             td_parent = a_tag.find_parent("td")
             if not td_parent:
+                continue
+
+            # Solo incluir si el evento está en vivo
+            is_live = td_parent.find("img", src="//cdn.livetv869.me/img/live.gif")
+            if not is_live:
                 continue
 
             span = td_parent.find("span", class_="evdesc")
@@ -61,7 +66,7 @@ class LiveTVProvider(BaseProvider):
 
             event_data.append((event_url, home, away, league, date_text))
 
-        # Ejecutar carga de streams en paralelo
+        # Cargar streams en paralelo
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_event = {
                 executor.submit(self.load_streams, url): (url, home, away, league, start_time)
@@ -128,11 +133,12 @@ class LiveTVProvider(BaseProvider):
                 language=None
             ))
             found += 1
-
-        if found:
-            print(f"[LiveTV] {found} stream(s) encontrados para: {event_url}")
-        else:
-            print(f"[LiveTV] No se encontraron streams en: {event_url}")
+        
+        # DEBUG
+        #if found:
+           # print(f"[LiveTV] {found} stream(s) encontrados para: {event_url}")
+        #else:
+        #    print(f"[LiveTV] No se encontraron streams en: {event_url}")
 
         return streams
 
