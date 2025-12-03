@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Tuple
+from typing import List
 import re
 import requests
 from bs4 import BeautifulSoup
@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 import urllib3
 import concurrent.futures
 from datetime import datetime
+from playwright.sync_api import sync_playwright
 
 from ..base import BaseProvider
 from ..models import Event, Stream
@@ -22,6 +23,9 @@ class LiveTVProvider(BaseProvider):
     name = "LiveTV"
     LIST_URL = "https://livetv.sx/enx/allupcoming/"
 
+    # ============================================================
+    # FETCH EVENTS
+    # ============================================================
     def fetch_events(self) -> List[Event]:
         events: List[Event] = []
 
@@ -41,7 +45,7 @@ class LiveTVProvider(BaseProvider):
                 continue
 
             if not td_parent.find("img", src="//cdn.livetv869.me/img/live.gif"):
-                continue  # solo eventos en vivo
+                continue
 
             event_url = urljoin("https://livetv.sx", a_tag["href"])
             event_text = a_tag.get_text(strip=True)
@@ -52,17 +56,14 @@ class LiveTVProvider(BaseProvider):
                 if sep in event_text:
                     home, away = map(str.strip, event_text.split(sep, 1))
                     break
-            else:
-                home, away = "", ""
 
             span = td_parent.find("span", class_="evdesc")
             if span:
-                full_text = span.get_text(separator="|", strip=True)
-                parts = full_text.split("|")
-                date_text = parts[0].strip() if len(parts) > 0 else ""
-                league = parts[1].strip(" ()") if len(parts) > 1 else ""
+                parts = span.get_text("|").split("|")
+                if len(parts) > 1:
+                    league = parts[1].strip(" ()")
 
-            event_data.append((event_url, home, away, league, date_text))
+            event_data.append((event_url, home, away, league))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_event = {
@@ -79,132 +80,162 @@ class LiveTVProvider(BaseProvider):
 
         return events
 
-    def _build_event_with_streams(self, url: str, home: str, away: str, league: str, start: str) -> Event | None:
+
+    # ============================================================
+    # SCRAP STREAMS WITH FALLBACK
+    # ============================================================
+    def _build_event_with_streams(self, url: str, home: str, away: str, league: str) -> Event | None:
+
+        # Load event page
         try:
             resp = requests.get(url, headers=UA_HEADERS, timeout=20, verify=False)
             resp.raise_for_status()
-        except Exception as e:
-            print(f"[LiveTV] Error al cargar evento {url}: {e}")
+        except:
             return None
 
         soup = BeautifulSoup(resp.text, "html.parser")
-
-        if not home or not away:
-            h1 = soup.select_one("h1.sporttitle b")
-            if h1:
-                text = h1.get_text(strip=True)
-                for sep in [" – ", " - ", " vs ", " Vs ", " v ", "–", "-"]:
-                    if sep in text:
-                        home, away = map(str.strip, text.split(sep, 1))
-                        break
-
-        if not league:
-            liga_tag = soup.select_one("td.small b a.menu")
-            if liga_tag:
-                league = liga_tag.get_text(strip=True)
-
-        match_time = start
-        try:
-            time_tag = soup.select_one("td.small b")
-            if time_tag:
-                match_text = time_tag.get_text(strip=True)
-                match = re.search(r"\d{1,2} \w+ \d{4} at \d{1,2}:\d{2}", match_text)
-                if match:
-                    match_time = datetime.strptime(match.group(), "%d %B %Y at %H:%M")
-        except Exception as e:
-            print(f"[LiveTV] Error procesando match_time para {url}: {e}")
-
-        streams: List[Stream] = []
+        streams = []
         found = 0
 
         for table in soup.find_all("table", class_="lnktbj"):
-            parent_td = table.find_parent("td")
-            if not parent_td:
-                continue
 
             play_link = table.find("a", href=True)
             if not play_link or "webplayer2.php" not in play_link["href"]:
                 continue
 
-            href = play_link["href"]
-            stream_url = urljoin("https://cdn.livetv869.me/", href)
-            
-            span_name = table.find("span", id=lambda x: x and x.startswith("ltonq"))
-            stream_name = span_name.get_text(strip=True) if span_name else f"Stream {found + 1}"
+            stream_url = urljoin("https://cdn.livetv869.me/", play_link["href"])
 
-            response = requests.get(stream_url, headers=UA_HEADERS, timeout=20, verify=False)
-            response.raise_for_status()
-            
-            # Buscar iframe en voodc
-            soup_stream = BeautifulSoup(response.text, "html.parser")
-            # Buscar todos los iframes y filtrar solo los válidos
-            # Buscar iframe directo con height=480 (YouTube o algunos simples)
-            iframes = soup_stream.find_all("iframe")
+            # Try normal request
+            try:
+                r2 = requests.get(stream_url, headers=UA_HEADERS, timeout=20, verify=False)
+                r2.raise_for_status()
+            except:
+                continue
+
+            soup2 = BeautifulSoup(r2.text, "html.parser")
+
             iframe_src = None
 
-            for fr in iframes:
+            # ============================================================
+            # 1) First: original YOUTUBE logic (height=480 or allowfullscreen)
+            # ============================================================
+            for fr in soup2.find_all("iframe"):
                 src = fr.get("src")
                 if not src:
                     continue
-                src = urljoin(stream_url, src)
+                    
+                full = urljoin(stream_url, src)
 
-                # Aceptamos cualquier iframe real de reproductor
-                if fr.get("height") == "480" or fr.get("allowfullscreen") == "true":
-                    iframe_src = src
+                h = fr.get("height")
+                allow = fr.get("allowfullscreen")
+
+                # print("→ Candidate iframe:", full)
+
+                # YOUTUBE by old logic
+                if h == "480" or allow == "true":
+                    iframe_src = full
+                    # print("   ✔ Valid YOUTUBE (height=480 / allowfullscreen)")
                     break
 
-            #  Si no existe iframe visible, hay que revisar scripts JS
+                # Modern youtube detection
+                if "youtube.com/embed" in full.lower():
+                    iframe_src = full
+                    # print("   ✔ Valid YOUTUBE (embed)")
+                    break
+
+                # EMB logic
+                if "emb" in full.lower():
+                    iframe_src = full
+                    # print("   ✔ Valid EMB")
+                    break
+
+            # ============================================================
+            # 2) Script-based URL (old logic)
+            # ============================================================
             if not iframe_src:
-                for script in soup_stream.find_all("script"):
-                    if not script.string:
-                        continue
-
-                    content = script.string
-
-                    # Buscar URLs que cargan el iframe final
+                for script in soup2.find_all("script"):
+                    content = script.string or ""
                     m = re.search(r'(https?://[^"\']+embed[^"\']+)', content)
                     if m:
                         iframe_src = m.group(1)
+                        # print("   ✔ Found embed in script")
                         break
 
-                    # Buscar llamadas tipo load("/embed/XYZ")
-                    m = re.search(r'load\(["\']([^"\']+)["\']', content)
-                    if m:
-                        iframe_src = urljoin(stream_url, m.group(1))
-                        break
 
-            # Última oportunidad: buscar en atributos data-*
+            # ============================================================
+            # 3) If still nothing, use Playwright
+            # ============================================================
             if not iframe_src:
-                for attr in ["data-src", "data-url", "data-iframe"]:
-                    for tag in soup_stream.find_all(attrs={attr: True}):
-                        iframe_src = urljoin(stream_url, tag[attr])
-                        break
-                    if iframe_src:
-                        break
+                # print(f"⚠ Playwright scanning: {stream_url}")
 
-            # Si aún no hay nada, no hay stream válido
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    page = browser.new_page()
+
+                    try:
+                        page.goto(stream_url, wait_until="domcontentloaded", timeout=15000)
+                        page.wait_for_timeout(1100)
+
+                        iframes = page.query_selector_all("iframe")
+                        # print("🔍 Playwright found:", len(iframes), "iframes")
+
+                        for fr in iframes:
+                            src = fr.get_attribute("src")
+                            if not src:
+                                continue
+
+                            full = urljoin(stream_url, src)
+                            # print("→ PW Candidate:", full)
+
+                            # EMB
+                            if "emb" in full.lower():
+                                iframe_src = full
+                                # print("   ✔ EMB (PW)")
+                                break
+
+                            # Youtube embed
+                            if "youtube.com/embed" in full.lower():
+                                iframe_src = full
+                                # print("   ✔ YouTube (PW)")
+                                break
+
+                        if not iframe_src:
+                            # Last fallback: script embed
+                            m = re.search(r'(https?://[^"\']+embed[^"\']+)', page.content())
+                            if m:
+                                iframe_src = m.group(1)
+                                # print("   ✔ Script embed fallback (PW)")
+
+                    except Exception as e:
+                        print("[PW ERROR]", e)
+
+                    browser.close()
+
+
+            # ============================================================
+            # If still nothing: ignore stream
+            # ============================================================
             if not iframe_src:
-                # print(f"[LiveTV] No se encontró iframe final para {stream_url}")
+                # print("❌ No valid iframe found\n")
                 continue
-            else:
-                print(iframe_src)
 
+            # Add valid stream
             streams.append(Stream(
-                name=stream_name,
+                name=f"Stream {found+1}",
                 url=iframe_src,
                 source=self.name
             ))
-
             found += 1
 
+        # Return Event
         return Event(
             id=url,
             name=f"{home} vs {away}",
             url=url,
-            league=league or "Próximamente",
-            home=home or "Próximamente",
-            away=away or "Próximamente",
-            match_time=match_time,
+            league=league,
+            home=home,
+            away=away,
+            match_time="",
             start_time=0,
             provider=self.name,
             streams=streams,
@@ -216,25 +247,12 @@ class LiveTVProvider(BaseProvider):
 
 # DEBUG
 if __name__ == "__main__":
-    liveTVProvider = LiveTVProvider()
-    events = liveTVProvider.fetch_events()
-    
-    print(f"\n🟢 Total de eventos en vivo: {len(events)}\n")
+    scraper = LiveTVProvider()
+    events = scraper.fetch_events()
 
-"""
+    print("\n🟢 Total eventos:", len(events))
     for e in events:
-        print("=" * 80)
-        print(f"📺 Nombre del evento : {e.name}")
-        print(f"🏆 Liga              : {e.league}")
-        print(f"⏰ Fecha/Hora        : {e.match_time}")
-        print(f"🏠 Local             : {e.home}")
-        print(f"🚌 Visitante         : {e.away}")
-        print(f"🖼 Logo Local        : {e.home_logo or 'N/A'}")
-        print(f"🖼 Logo Visitante    : {e.away_logo or 'N/A'}")
-        print(f"🖼 Logo Liga         : {e.league_logo or 'N/A'}")
-        print(f"🔗 URL del evento    : {e.url}")
-        print(f"🎥 Streams ({len(e.streams)}):")
+        print("============")
+        print(e.name)
         for s in e.streams:
-            print(f"   • {s.name or 'Sin nombre'} => {s.url}")
-        print("=" * 80 + "\n")
-#"""
+            print(" →", s.url)
