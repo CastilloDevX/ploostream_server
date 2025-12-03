@@ -128,25 +128,74 @@ class LiveTVProvider(BaseProvider):
 
             href = play_link["href"]
             stream_url = urljoin("https://cdn.livetv869.me/", href)
-
+            
             span_name = table.find("span", id=lambda x: x and x.startswith("ltonq"))
             stream_name = span_name.get_text(strip=True) if span_name else f"Stream {found + 1}"
 
+            response = requests.get(stream_url, headers=UA_HEADERS, timeout=20, verify=False)
+            response.raise_for_status()
+            
+            # Buscar iframe en voodc
+            soup_stream = BeautifulSoup(response.text, "html.parser")
+            # Buscar todos los iframes y filtrar solo los válidos
+            # Buscar iframe directo con height=480 (YouTube o algunos simples)
+            iframes = soup_stream.find_all("iframe")
+            iframe_src = None
+
+            for fr in iframes:
+                src = fr.get("src")
+                if not src:
+                    continue
+                src = urljoin(stream_url, src)
+
+                # Aceptamos cualquier iframe real de reproductor
+                if fr.get("height") == "480" or fr.get("allowfullscreen") == "true":
+                    iframe_src = src
+                    break
+
+            #  Si no existe iframe visible, hay que revisar scripts JS
+            if not iframe_src:
+                for script in soup_stream.find_all("script"):
+                    if not script.string:
+                        continue
+
+                    content = script.string
+
+                    # Buscar URLs que cargan el iframe final
+                    m = re.search(r'(https?://[^"\']+embed[^"\']+)', content)
+                    if m:
+                        iframe_src = m.group(1)
+                        break
+
+                    # Buscar llamadas tipo load("/embed/XYZ")
+                    m = re.search(r'load\(["\']([^"\']+)["\']', content)
+                    if m:
+                        iframe_src = urljoin(stream_url, m.group(1))
+                        break
+
+            # Última oportunidad: buscar en atributos data-*
+            if not iframe_src:
+                for attr in ["data-src", "data-url", "data-iframe"]:
+                    for tag in soup_stream.find_all(attrs={attr: True}):
+                        iframe_src = urljoin(stream_url, tag[attr])
+                        break
+                    if iframe_src:
+                        break
+
+            # Si aún no hay nada, no hay stream válido
+            if not iframe_src:
+                # print(f"[LiveTV] No se encontró iframe final para {stream_url}")
+                continue
+            else:
+                print(iframe_src)
+
             streams.append(Stream(
                 name=stream_name,
-                url=stream_url,
-                source=self.name,
-                language=None
+                url=iframe_src,
+                source=self.name
             ))
+
             found += 1
-        #DEBUG
-        #print("=" * 80)
-        #print(f"🏆 Liga              : {league}")
-        #print(f"🏠 Local             : {home}")
-        #print(f"🚌 Visitante         : {away}")
-        #print(f"🔗 URL del evento    : {url}")
-        #print(f"🎥 Streams ({len(streams)}):")
-        #print("=" * 80)
 
         return Event(
             id=url,
@@ -164,15 +213,15 @@ class LiveTVProvider(BaseProvider):
             league_logo=get_team_logo(league)
         )
 
-"""
+
 # DEBUG
 if __name__ == "__main__":
     liveTVProvider = LiveTVProvider()
     events = liveTVProvider.fetch_events()
     
-
     print(f"\n🟢 Total de eventos en vivo: {len(events)}\n")
 
+"""
     for e in events:
         print("=" * 80)
         print(f"📺 Nombre del evento : {e.name}")
@@ -188,4 +237,4 @@ if __name__ == "__main__":
         for s in e.streams:
             print(f"   • {s.name or 'Sin nombre'} => {s.url}")
         print("=" * 80 + "\n")
-"""
+#"""
